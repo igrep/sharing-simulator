@@ -1,0 +1,21 @@
+{
+  "type": "module",
+  "name": "sharing-simulartor",
+  "version": "1.0.0",
+  "description": "Simulation of sharing references between different threads",
+  "dependencies": {
+    "acorn": "^8.19.0",
+    "astring": "^1.9.0",
+    "vanjs-core": "^1.6.1"
+  },
+  "devDependencies": {
+    "@eslint/css": "^2.0.1",
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.13.0",
+    "globals": "^17.13.0",
+    "prettier": "^3.9.10",
+    "typescript": "^7.0.2",
+    "typescript-eslint": "^8.72.1",
+    "vite": "^8.3.5"
+  }
+}
