@@ -3,6 +3,7 @@ import {
   type ArrowFunctionExpression,
   type Identifier,
   type ModuleDeclaration,
+  type Node,
   type Program,
   type SourceLocation,
   type Statement,
@@ -136,19 +137,19 @@ export function createMainEnvironment(
 //     - Q. Track only expressions that are assigned to variables or including
 //          others?
 // - Transform assignments to variables into `$ENV.<varName> = value` form.
-export interface ProgramForSimulration {
+export interface ProgramForSimulration extends Node {
   type: "Program";
   body: StatementForSimulation[];
   sourceType: "script";
 }
 export type StatementForSimulation = ExpressionStatementForSimulation;
 // NOTE: But this is converted to AssignmentExpressionForSimulation in the transformed code.
-export interface VariableDeclarationForSimulation {
+export interface VariableDeclarationForSimulation extends Node {
   type: "VariableDeclaration";
   declarations: VariableDeclarator[];
   kind: "var" | "let" | "const";
 }
-export interface ExpressionStatementForSimulation {
+export interface ExpressionStatementForSimulation extends Node {
   type: "ExpressionStatement";
   expression: ExpressionForSimulation;
 }
@@ -157,60 +158,79 @@ export type ExpressionForSimulation =
   | AssignmentExpressionForSimulation
   | AssignmentOnmessageExpressionForSimulation
   | MemberExpressionForSimulation
+  | ArrayExpressionForSimulation
+  | ObjectExpressionForSimulation
   | CallExpressionForSimulation;
-export interface LiteralForSimulation {
+export interface LiteralForSimulation extends Node {
   type: "Literal";
-  value: string | number | boolean | null;
+  value?: string | number | boolean | null;
 }
-export interface AssignmentExpressionForSimulation {
+export interface AssignmentExpressionForSimulation extends Node {
   type: "AssignmentExpression";
   operator: "=";
   left: MemberExpressionForSimulation;
   right: ExpressionForSimulation;
 }
-export interface AssignmentOnmessageExpressionForSimulation {
+export interface AssignmentOnmessageExpressionForSimulation extends Node {
   type: "AssignmentExpression";
   operator: "=";
   left: OnmessageIdentifierForSimulation;
   right: ArrowFunctionExpression;
 }
-export interface MemberExpressionForSimulation {
+export interface MemberExpressionForSimulation extends Node {
   type: "MemberExpression";
   object: IdentifierForSimulation;
-  property: Identifier;
+  property: ExpressionForProperty;
+  computed: boolean;
+  optional: boolean;
 }
-export interface IdentifierForSimulation {
-  type: "Identifier";
+export type ExpressionForProperty =
+  | Identifier
+  | LiteralForSimulation
+  | MemberExpressionForProperty;
+export interface MemberExpressionForProperty extends Node {
+  type: "MemberExpression";
+  object: ExpressionForProperty;
+  property: ExpressionForProperty;
+  computed: boolean;
+  optional: boolean;
+}
+export interface IdentifierForSimulation extends Node {
   name: typeof envArgName | typeof trackerArgName;
 }
-export interface OnmessageIdentifierForSimulation {
+export interface OnmessageIdentifierForSimulation extends Node {
   type: "Identifier";
   name: "onmessage";
 }
-export interface BlockStatementForSimulation {
+export interface BlockStatementForSimulation extends Node {
   type: "BlockStatement";
   body: StatementForSimulation[];
 }
-export interface CallExpressionForSimulation {
+export interface ArrayExpressionForSimulation extends Node {
+  type: "ArrayExpression"
+}
+export interface ObjectExpressionForSimulation extends Node {
+}
+export interface CallExpressionForSimulation extends Node {
   type: "CallExpression";
   callee: MemberExpressionForWorkerOrTracker;
   arguments: ExpressionForSimulation[];
 }
-export interface MemberExpressionForWorkerOrTracker {
+export interface MemberExpressionForWorkerOrTracker extends Node {
   type: "MemberExpression";
   object: MemberExpressionForWorker | IdentifierForTracker;
   property: IdentifierForSimulation;
 }
-export interface MemberExpressionForWorker {
+export interface MemberExpressionForWorker extends Node {
   type: "MemberExpression";
   object: typeof envArgName;
   property: IdentifierForWorker;
 }
-export interface IdentifierForTracker {
+export interface IdentifierForTracker extends Node {
   type: "Identifier";
   name: typeof trackerArgName;
 }
-export interface IdentifierForWorker {
+export interface IdentifierForWorker extends Node {
   type: "Identifier";
   name: "worker";
 }
@@ -232,6 +252,7 @@ export function transformWithDebug(name: string, code: string): string {
 
 export function transform(program: Program): ProgramForSimulration {
   return {
+    ...program,
     type: "Program",
     body: program.body.flatMap(
       (statement: Statement | ModuleDeclaration): StatementForSimulation[] => {
@@ -248,32 +269,52 @@ export function transform(program: Program): ProgramForSimulration {
               (
                 declarator: VariableDeclarator,
               ): ExpressionStatementForSimulation => {
-                if (declarator.init === null) {
+                if (declarator.init == null) {
                   throw UnsupportedSyntaxError(
                     `${statement.type} without initializer`,
                     statement.loc,
                   );
                 }
+                if (
+                  declarator.id.type !== "Identifier" &&
+                  declarator.id.type !== "MemberExpression"
+                ) {
+                  throw UnsupportedSyntaxError(
+                    `The left operand of assignment must be an Identifier or a MemberExpression, but ${declarator.id.type}`,
+                    declarator.loc,
+                  );
+                }
                 return {
+                  ...statement,
                   type: "ExpressionStatement",
                   expression: {
                     type: "AssignmentExpression",
                     operator: "=",
                     left: {
+                      ...declarator.id,
                       type: "MemberExpression",
-                      object: { type: "Identifier", name: envArgName },
-                      property: declarator.id as IdentifierForSimulation,
+                      object: {
+                        ...declarator.id,
+                        type: "Identifier",
+                        name: envArgName,
+                      },
+                      property: declarator.id,
+                      computed: false,
+                      optional: false,
                     },
-                    right: declarator.init as ExpressionForSimulation,
+                    right: declarator.init,
                   },
                 };
               },
             );
           case "ExpressionStatement":
-            return {
-              type: "ExpressionStatement",
-              expression: statement.expression as ExpressionForSimulation,
-            };
+            return [
+              {
+                ...statement,
+                type: "ExpressionStatement",
+                expression: statement.expression,
+              },
+            ];
           default: {
             throw UnsupportedSyntaxError(statement.type, statement.loc);
           }
