@@ -1,12 +1,15 @@
 import {
   parse,
   type ArrowFunctionExpression,
+  type Expression,
   type Identifier,
   type ModuleDeclaration,
   type Node,
+  type PrivateIdentifier,
   type Program,
   type SourceLocation,
   type Statement,
+  type Super,
   type VariableDeclarator,
 } from "acorn";
 import { generate } from "astring";
@@ -49,12 +52,17 @@ export async function evaluate(
   );
 }
 
+export type ObjectId = number;
+
 export class Tracker {
   #objectIdCounter = 0;
-  #trackedObjects = new Set<number>();
-  // Perhaps we don't need to track primitive values except for strings.
-  // But we can track all values for simplicity.
-  #trackedValues = new Set<number | string | boolean | null | undefined>();
+
+  #trackedObjects = new Set<ObjectId>();
+  #unusedObjects = new Set<ObjectId>();
+
+  // We may not need to track strings.
+  #trackedValues = new Set<string>();
+  #unusedValues = new Set<string>();
   threadId: symbol;
 
   constructor(threadId: symbol) {
@@ -64,12 +72,15 @@ export class Tracker {
   track<T>(value: T): T {
     if (typeof value === "object" && value !== null) {
       const objectId = this.#objectIdCounter++;
-      (value as Record<symbol, number>)[this.threadId] = objectId;
-      this.#trackedObjects.add(objectId);
-    } else {
-      this.#trackedValues.add(
-        value as number | string | boolean | null | undefined,
-      );
+      if ((value as Record<symbol, ObjectId>)[this.threadId] !== undefined) {
+        (value as Record<symbol, ObjectId>)[this.threadId] = objectId;
+        this.#trackedObjects.add(objectId);
+        for (const childValue of Object.values(value)) {
+          this.track(childValue);
+        }
+      }
+    } else if (typeof value === "string") {
+      this.#trackedValues.add(value);
     }
     return value;
   }
@@ -81,6 +92,7 @@ export class Tracker {
     // `Object.defineProperty` to define a property with a getter that throws an
     // error when accessed. This way, we can simulate the behavior of
     // transferring ownership of the object to another thread.
+    const this_ = this;
     function go(subEnv: Environment): void {
       for (const [key, value] of Object.entries(subEnv)) {
         if (values.includes(value)) {
@@ -95,12 +107,31 @@ export class Tracker {
             writable: true,
           });
           to.track(value);
-        } else if (typeof value === "object" && value !== null) {
+        }
+        if (typeof value === "object" && value !== null) {
+          const objectId = (value as Record<symbol, ObjectId>)[this_.threadId];
+          assertObjectIdAvailable(objectId, key, this_.threadId);
+          this_.#trackedObjects.delete(objectId);
+          this_.#unusedObjects.add(objectId);
           go(value);
+        } else if (typeof value === "string") {
+          this_.#trackedValues.delete(value);
+          this_.#unusedValues.add(value);
         }
       }
     }
     go(from);
+  }
+
+  replace(
+    newTrackedObjects: Set<ObjectId>,
+    newTrackedValues: Set<string>,
+  ): void {
+    this.#unusedObjects = this.#trackedObjects.difference(newTrackedObjects);
+    this.#trackedObjects = newTrackedObjects;
+
+    this.#unusedValues = this.#trackedValues.difference(newTrackedValues);
+    this.#trackedValues = newTrackedValues;
   }
 }
 
@@ -185,9 +216,7 @@ export interface MemberExpressionForSimulation extends Node {
   optional: boolean;
 }
 export type ExpressionForProperty =
-  | Identifier
-  | LiteralForSimulation
-  | MemberExpressionForProperty;
+  Identifier | LiteralForSimulation | MemberExpressionForProperty;
 export interface MemberExpressionForProperty extends Node {
   type: "MemberExpression";
   object: ExpressionForProperty;
@@ -207,9 +236,21 @@ export interface BlockStatementForSimulation extends Node {
   body: StatementForSimulation[];
 }
 export interface ArrayExpressionForSimulation extends Node {
-  type: "ArrayExpression"
+  type: "ArrayExpression";
+  elements: ExpressionForSimulation[];
 }
 export interface ObjectExpressionForSimulation extends Node {
+  type: "ObjectExpression";
+  properties: PropertyForSimulation[];
+}
+export interface PropertyForSimulation extends Node {
+  type: "Property";
+  key: ExpressionForProperty;
+  value: ExpressionForSimulation;
+  kind: "init" | "get" | "set";
+  method: boolean;
+  shorthand: boolean;
+  computed: boolean;
 }
 export interface CallExpressionForSimulation extends Node {
   type: "CallExpression";
@@ -219,7 +260,7 @@ export interface CallExpressionForSimulation extends Node {
 export interface MemberExpressionForWorkerOrTracker extends Node {
   type: "MemberExpression";
   object: MemberExpressionForWorker | IdentifierForTracker;
-  property: IdentifierForSimulation;
+  property: Identifier;
 }
 export interface MemberExpressionForWorker extends Node {
   type: "MemberExpression";
@@ -254,79 +295,283 @@ export function transform(program: Program): ProgramForSimulration {
   return {
     ...program,
     type: "Program",
-    body: program.body.flatMap(
-      (statement: Statement | ModuleDeclaration): StatementForSimulation[] => {
-        switch (statement.type) {
-          case "VariableDeclaration":
-            if (
-              statement.kind !== "var" &&
-              statement.kind !== "let" &&
-              statement.kind !== "const"
-            ) {
-              throw UnsupportedSyntaxError(`${statement.type}`, statement.loc);
-            }
-            return statement.declarations.map(
-              (
-                declarator: VariableDeclarator,
-              ): ExpressionStatementForSimulation => {
-                if (declarator.init == null) {
-                  throw UnsupportedSyntaxError(
-                    `${statement.type} without initializer`,
-                    statement.loc,
-                  );
-                }
-                if (
-                  declarator.id.type !== "Identifier" &&
-                  declarator.id.type !== "MemberExpression"
-                ) {
-                  throw UnsupportedSyntaxError(
-                    `The left operand of assignment must be an Identifier or a MemberExpression, but ${declarator.id.type}`,
-                    declarator.loc,
-                  );
-                }
-                return {
-                  ...statement,
-                  type: "ExpressionStatement",
-                  expression: {
-                    type: "AssignmentExpression",
-                    operator: "=",
-                    left: {
-                      ...declarator.id,
-                      type: "MemberExpression",
-                      object: {
-                        ...declarator.id,
-                        type: "Identifier",
-                        name: envArgName,
-                      },
-                      property: declarator.id,
-                      computed: false,
-                      optional: false,
-                    },
-                    right: declarator.init,
-                  },
-                };
-              },
-            );
-          case "ExpressionStatement":
-            return [
-              {
-                ...statement,
-                type: "ExpressionStatement",
-                expression: statement.expression,
-              },
-            ];
-          default: {
-            throw UnsupportedSyntaxError(statement.type, statement.loc);
-          }
-        }
-      },
-    ),
     sourceType: "script",
+    body: transformStatements(program.body),
   };
 }
 
-export function collect(environment: Environment) {
-  // Collect all the accessible objects and arrays from the environment
+export function transformStatements(
+  statements: Array<Statement | ModuleDeclaration>,
+): StatementForSimulation[] {
+  return statements.flatMap(
+    (statement: Statement | ModuleDeclaration): StatementForSimulation[] => {
+      switch (statement.type) {
+        case "VariableDeclaration":
+          if (
+            statement.kind !== "var" &&
+            statement.kind !== "let" &&
+            statement.kind !== "const"
+          ) {
+            throw UnsupportedSyntaxError(`${statement.type}`, statement.loc);
+          }
+          return statement.declarations.map(
+            (
+              declarator: VariableDeclarator,
+            ): ExpressionStatementForSimulation => {
+              if (declarator.init == null) {
+                throw UnsupportedSyntaxError(
+                  `${statement.type} without initializer`,
+                  statement.loc,
+                );
+              }
+              if (
+                declarator.id.type !== "Identifier" &&
+                declarator.id.type !== "MemberExpression"
+              ) {
+                throw UnsupportedSyntaxError(
+                  `The left operand of assignment must be an Identifier or a MemberExpression, but ${declarator.id.type}`,
+                  declarator.loc,
+                );
+              }
+              return {
+                ...statement,
+                type: "ExpressionStatement",
+                expression: {
+                  ...declarator,
+                  type: "AssignmentExpression",
+                  operator: "=",
+                  left: {
+                    ...declarator.id,
+                    type: "MemberExpression",
+                    object: {
+                      ...declarator.id,
+                      type: "Identifier",
+                      name: envArgName,
+                    },
+                    property: validateProperty(declarator.id),
+                    computed: false,
+                    optional: false,
+                  },
+                  right: wrapWithTrackerCall(
+                    transformExpression(declarator.init),
+                  ),
+                },
+              };
+            },
+          );
+        case "ExpressionStatement":
+          return [
+            {
+              ...statement,
+              type: "ExpressionStatement",
+              expression: transformExpression(statement.expression),
+            },
+          ];
+        default: {
+          throw UnsupportedSyntaxError(statement.type, statement.loc);
+        }
+      }
+    },
+  );
+}
+
+export function transformExpression(
+  expression: Expression,
+): ExpressionForSimulation {
+  switch (expression.type) {
+    case "Literal":
+      if (
+        typeof expression.value === "string" ||
+        typeof expression.value === "number" ||
+        typeof expression.value === "boolean" ||
+        expression.value == null
+      ) {
+        return expression as LiteralForSimulation;
+      }
+      throw UnsupportedSyntaxError(
+        `Literal value must be string, number, boolean, or null, but got ${typeof expression.value}`,
+        expression.loc,
+      );
+    case "AssignmentExpression":
+      if (
+        expression.left.type !== "Identifier" &&
+        expression.left.type !== "MemberExpression"
+      ) {
+        throw UnsupportedSyntaxError(
+          `The left operand of assignment must be an Identifier or a MemberExpression, but ${expression.left.type}`,
+          expression.loc,
+        );
+      }
+      if (
+        expression.left.type === "Identifier" &&
+        expression.left.name === "onmessage"
+      ) {
+        if (expression.right.type !== "ArrowFunctionExpression") {
+          throw UnsupportedSyntaxError(
+            `The right operand of assignment to 'onmessage' must be an ArrowFunctionExpression, but ${expression.right.type}`,
+            expression.loc,
+          );
+        }
+        return {
+          ...expression,
+          type: "AssignmentExpression",
+          operator: "=",
+          left: {
+            ...expression.left,
+            type: "Identifier",
+            name: "onmessage",
+          },
+          right: expression.right,
+        };
+      }
+      return {
+        ...expression,
+        type: "AssignmentExpression",
+        operator: "=",
+        left: {
+          ...expression.left,
+          type: "MemberExpression",
+          object: {
+            ...expression.left,
+            type: "Identifier",
+            name: envArgName,
+          },
+          property: validateProperty(expression.left),
+          computed: false,
+          optional: false,
+        },
+        right: wrapWithTrackerCall(transformExpression(expression.right)),
+      };
+    case "MemberExpression":
+      return {
+        ...expression,
+        type: "MemberExpression",
+        object: {
+          ...expression.object,
+          type: "Identifier",
+          name: envArgName,
+        },
+        property: validateProperty(expression.property),
+        computed: expression.computed,
+        optional: expression.optional,
+      };
+    default:
+      throw UnsupportedSyntaxError(
+        `Unsupported expression type ${expression.type}`,
+        expression.loc,
+      );
+  }
+}
+
+export function wrapWithTrackerCall(
+  expression: ExpressionForSimulation,
+): CallExpressionForSimulation {
+  return {
+    ...expression,
+    type: "CallExpression",
+    callee: {
+      ...expression,
+      type: "MemberExpression",
+      object: {
+        ...expression,
+        type: "Identifier",
+        name: trackerArgName,
+      },
+      property: {
+        ...expression,
+        type: "Identifier",
+        name: "track",
+      },
+    },
+    arguments: [expression],
+  };
+}
+
+export function validateProperty(
+  root: Expression | PrivateIdentifier,
+): ExpressionForProperty {
+  function error(node: Node): never {
+    const rootSrc = generate(root);
+    throw UnsupportedSyntaxError(
+      `MemberExpression \`${rootSrc}\` must consist of only Identifier or MemberExpression, but contains ${node.type}`,
+      node.loc,
+    );
+  }
+  function validatePropertyComponent(
+    component: Expression | Super | PrivateIdentifier,
+  ): ExpressionForProperty {
+    switch (component.type) {
+      case "Identifier":
+        return component;
+      case "Literal":
+        if (
+          typeof component.value === "string" ||
+          typeof component.value === "number" ||
+          typeof component.value === "boolean" ||
+          component.value == null
+        ) {
+          return component as LiteralForSimulation;
+        }
+        error(component);
+      case "MemberExpression":
+        return {
+          ...component,
+          type: "MemberExpression",
+          object: validatePropertyComponent(component.object),
+          property: validatePropertyComponent(component.property),
+          computed: component.computed,
+          optional: component.optional,
+        };
+      default:
+        error(component);
+    }
+  }
+  switch (root.type) {
+    case "Identifier":
+      return root;
+    case "MemberExpression":
+      return {
+        ...root,
+        type: "MemberExpression",
+        object: validatePropertyComponent(root.object),
+        property: validatePropertyComponent(root.property),
+      };
+    default:
+      error(root);
+  }
+}
+
+function assertObjectIdAvailable(
+  objectId: ObjectId | undefined,
+  key: string,
+  threadId: symbol,
+): asserts objectId is ObjectId {
+  if (objectId === undefined) {
+    const errorMessage = `Assertion failure: Object '${key}' does not have an ID for thread ${String(threadId)}`;
+    throw new Error(errorMessage);
+  }
+}
+
+export function collectAndMarkUnused(
+  environment: Environment,
+  tracker: Tracker,
+): void {
+  const reachableObjects = new Set<ObjectId>();
+  const reachableValues = new Set<string>();
+  function go(subEnv: Environment): void {
+    for (const [key, value] of Object.entries(subEnv)) {
+      if (typeof value === "object" && value !== null) {
+        const objectId = (value as Record<symbol, ObjectId>)[tracker.threadId];
+        assertObjectIdAvailable(objectId, key, tracker.threadId);
+        reachableObjects.add(objectId);
+        go(value);
+      } else if (typeof value === "string") {
+        reachableValues.add(value);
+      }
+    }
+  }
+  go(environment);
+  tracker.replace(reachableObjects, reachableValues);
 }
 
 function UnsupportedSyntaxError(
