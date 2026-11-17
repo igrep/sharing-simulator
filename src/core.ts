@@ -29,10 +29,29 @@ const workerThreadId = Symbol("worker");
 const mainThreadId = Symbol("main");
 const trackerArgName = "$TRACKER" as const;
 
+export const EvaluationMode = {
+  SIMULATE_TRANSFER: 1,
+  SIMULATE_SHARING: 2,
+  RUN_REAL_WORKER: 3,
+} as const;
+
+export type EvaluationMode =
+  (typeof EvaluationMode)[keyof typeof EvaluationMode];
+
 export async function evaluate(
   mainCode: string,
   workerCode: string,
+  mode: EvaluationMode,
 ): Promise<void> {
+  if (mode === EvaluationMode.RUN_REAL_WORKER) {
+    const blob = new Blob([workerCode], { type: "application/javascript" });
+    const worker = new Worker(URL.createObjectURL(blob));
+    const modMain = await importModuleFromJsSrc(
+      `export default function(worker) { ${mainCode} }`,
+    );
+    modMain.default(worker);
+    return;
+  }
   const minifiedSourceWorker = transformWithDebug("worker", workerCode);
   const modWorker = await importModuleFromJsSrc(
     `export default function(${envArgName}, ${trackerArgName}) { ${minifiedSourceWorker} }`,
@@ -47,7 +66,12 @@ export async function evaluate(
   );
   const mainTracker = new Tracker(mainThreadId);
   modMain.default(
-    createMainEnvironment(workerEnvironment, workerTracker, mainTracker),
+    createMainEnvironment(
+      workerEnvironment,
+      workerTracker,
+      mainTracker,
+      mode === EvaluationMode.SIMULATE_TRANSFER,
+    ),
     workerTracker,
   );
 }
@@ -71,8 +95,8 @@ export class Tracker {
 
   track<T>(value: T): T {
     if (typeof value === "object" && value !== null) {
-      const objectId = this.#objectIdCounter++;
       if ((value as Record<symbol, ObjectId>)[this.threadId] !== undefined) {
+        const objectId = this.#objectIdCounter++;
         (value as Record<symbol, ObjectId>)[this.threadId] = objectId;
         this.#trackedObjects.add(objectId);
         for (const childValue of Object.values(value)) {
@@ -133,20 +157,65 @@ export class Tracker {
     this.#unusedValues = this.#trackedValues.difference(newTrackedValues);
     this.#trackedValues = newTrackedValues;
   }
+
+  hasMarkedUnused(objectIdOrValue: ObjectId | string): boolean {
+    if (typeof objectIdOrValue === "number") {
+      return this.#unusedObjects.has(objectIdOrValue);
+    } else if (typeof objectIdOrValue === "string") {
+      return this.#unusedValues.has(objectIdOrValue);
+    }
+    return false;
+  }
 }
 
-export function createMainEnvironment(
+function createMainEnvironment(
   workerEnvironment: Environment,
   workerTracker: Tracker,
   mainTracker: Tracker,
+  doesTransfer: boolean,
 ): MainEnvironment {
   const this_: MainEnvironment = {
     worker: {
       postMessage(message: any, _targetOrigin_ignored: null, transfer: any[]) {
-        // Simulate the worker's postMessage behavior
+        const cloneMessage = (message: any): any => {
+          if (typeof message === "object" && message !== null) {
+            if (transfer.includes(message)) {
+              if (message instanceof ArrayBuffer) {
+                return message;
+              }
+              throw new Error(
+                `Only ArrayBuffer can be transferred, but got ${message.constructor}`,
+              );
+            }
+            if (Array.isArray(message)) {
+              return message.map(cloneMessage);
+            } else {
+              const cloned: Record<string, any> = Object.create(null);
+              for (const [key, value] of Object.entries(message)) {
+                cloned[key] = cloneMessage(value);
+              }
+              return cloned;
+            }
+          } else {
+            return message;
+          }
+        };
+
+        for (const value of transfer) {
+          if (!(value instanceof ArrayBuffer)) {
+            throw new Error(
+              `Only ArrayBuffer can be transferred, but got ${typeof value}`,
+            );
+          }
+        }
+
         console.log("Simulated worker received message:", message);
-        mainTracker.transfer(transfer, this_, workerTracker);
-        workerEnvironment.onmessage?.({ data: message });
+        if (doesTransfer) {
+          mainTracker.transfer(transfer, this_, workerTracker);
+        }
+        workerEnvironment.onmessage?.({
+          data: workerTracker.track(cloneMessage(message)),
+        });
       },
     },
   };
@@ -191,7 +260,8 @@ export type ExpressionForSimulation =
   | MemberExpressionForSimulation
   | ArrayExpressionForSimulation
   | ObjectExpressionForSimulation
-  | CallExpressionForSimulation;
+  | CallExpressionForSimulation
+  | NewArrayBufferExpressionForSimulation;
 export interface LiteralForSimulation extends Node {
   type: "Literal";
   value?: string | number | boolean | null;
@@ -275,6 +345,15 @@ export interface IdentifierForWorker extends Node {
   type: "Identifier";
   name: "worker";
 }
+export interface NewArrayBufferExpressionForSimulation extends Node {
+  type: "NewExpression";
+  callee: IdentifierForNewArrayBuffer;
+  arguments: ExpressionForSimulation[];
+}
+export interface IdentifierForNewArrayBuffer extends Node {
+  type: "Identifier";
+  name: "ArrayBuffer";
+}
 
 export function transformWithDebug(name: string, code: string): string {
   console.debug(`BEFORE transform ${name}:`, code);
@@ -312,14 +391,17 @@ export function transformStatements(
             statement.kind !== "let" &&
             statement.kind !== "const"
           ) {
-            throw UnsupportedSyntaxError(`${statement.type}`, statement.loc);
+            throw new UnsupportedSyntaxError(
+              `${statement.type}`,
+              statement.loc,
+            );
           }
           return statement.declarations.map(
             (
               declarator: VariableDeclarator,
             ): ExpressionStatementForSimulation => {
               if (declarator.init == null) {
-                throw UnsupportedSyntaxError(
+                throw new UnsupportedSyntaxError(
                   `${statement.type} without initializer`,
                   statement.loc,
                 );
@@ -328,7 +410,7 @@ export function transformStatements(
                 declarator.id.type !== "Identifier" &&
                 declarator.id.type !== "MemberExpression"
               ) {
-                throw UnsupportedSyntaxError(
+                throw new UnsupportedSyntaxError(
                   `The left operand of assignment must be an Identifier or a MemberExpression, but ${declarator.id.type}`,
                   declarator.loc,
                 );
@@ -368,7 +450,7 @@ export function transformStatements(
             },
           ];
         default: {
-          throw UnsupportedSyntaxError(statement.type, statement.loc);
+          throw new UnsupportedSyntaxError(statement.type, statement.loc);
         }
       }
     },
@@ -388,7 +470,7 @@ export function transformExpression(
       ) {
         return expression as LiteralForSimulation;
       }
-      throw UnsupportedSyntaxError(
+      throw new UnsupportedSyntaxError(
         `Literal value must be string, number, boolean, or null, but got ${typeof expression.value}`,
         expression.loc,
       );
@@ -397,7 +479,7 @@ export function transformExpression(
         expression.left.type !== "Identifier" &&
         expression.left.type !== "MemberExpression"
       ) {
-        throw UnsupportedSyntaxError(
+        throw new UnsupportedSyntaxError(
           `The left operand of assignment must be an Identifier or a MemberExpression, but ${expression.left.type}`,
           expression.loc,
         );
@@ -407,7 +489,7 @@ export function transformExpression(
         expression.left.name === "onmessage"
       ) {
         if (expression.right.type !== "ArrowFunctionExpression") {
-          throw UnsupportedSyntaxError(
+          throw new UnsupportedSyntaxError(
             `The right operand of assignment to 'onmessage' must be an ArrowFunctionExpression, but ${expression.right.type}`,
             expression.loc,
           );
@@ -455,8 +537,112 @@ export function transformExpression(
         computed: expression.computed,
         optional: expression.optional,
       };
+    case "ArrayExpression":
+      return {
+        ...expression,
+        type: "ArrayExpression",
+        elements: expression.elements.map((element) => {
+          if (element == null) {
+            throw new UnsupportedSyntaxError(
+              `ArrayExpression elements must not be null`,
+              expression.loc,
+            );
+          }
+          if (element.type === "SpreadElement") {
+            throw new UnsupportedSyntaxError(
+              `ArrayExpression elements must not be SpreadElement`,
+              expression.loc,
+            );
+          }
+          return transformExpression(element);
+        }),
+      };
+    case "ObjectExpression":
+      return {
+        ...expression,
+        type: "ObjectExpression",
+        properties: expression.properties.map((property) => {
+          if (property.type !== "Property") {
+            throw new UnsupportedSyntaxError(
+              `ObjectExpression properties must be Property, but got ${property.type}`,
+              expression.loc,
+            );
+          }
+          return {
+            ...property,
+            key: validateProperty(property.key),
+            value: transformExpression(property.value),
+          };
+        }),
+      };
+    case "CallExpression":
+      if (
+        expression.callee.type === "MemberExpression" &&
+        expression.callee.object.type === "Identifier" &&
+        expression.callee.object.name === "worker"
+      ) {
+        return {
+          ...expression,
+          type: "CallExpression",
+          callee: {
+            ...expression.callee,
+            type: "MemberExpression",
+            object: {
+              ...expression.callee.object,
+              type: "Identifier",
+              name: envArgName,
+            },
+            property: {
+              ...expression.callee.property,
+              type: "Identifier",
+              name: "worker",
+            },
+          },
+          arguments: expression.arguments.map((arg) => {
+            if (arg.type === "SpreadElement") {
+              throw new UnsupportedSyntaxError(
+                `CallExpression arguments must not be SpreadElement`,
+                expression.loc,
+              );
+            }
+            return transformExpression(arg);
+          }),
+        };
+      }
+      throw new UnsupportedSyntaxError(
+        `CallExpression must be a call to 'worker'`,
+        expression.loc,
+      );
+    case "NewExpression":
+      if (
+        expression.callee.type === "Identifier" &&
+        expression.callee.name === "ArrayBuffer"
+      ) {
+        return {
+          ...expression,
+          type: "NewExpression",
+          callee: {
+            ...expression.callee,
+            type: "Identifier",
+            name: "ArrayBuffer",
+          },
+          arguments: expression.arguments.map((arg) => {
+            if (arg.type === "SpreadElement") {
+              throw new UnsupportedSyntaxError(
+                `NewExpression arguments must not be SpreadElement`,
+                expression.loc,
+              );
+            }
+            return transformExpression(arg);
+          }),
+        };
+      }
+      throw new UnsupportedSyntaxError(
+        `NewExpression must be a call to 'ArrayBuffer'`,
+        expression.loc,
+      );
     default:
-      throw UnsupportedSyntaxError(
+      throw new UnsupportedSyntaxError(
         `Unsupported expression type ${expression.type}`,
         expression.loc,
       );
@@ -492,7 +678,7 @@ export function validateProperty(
 ): ExpressionForProperty {
   function error(node: Node): never {
     const rootSrc = generate(root);
-    throw UnsupportedSyntaxError(
+    throw new UnsupportedSyntaxError(
       `MemberExpression \`${rootSrc}\` must consist of only Identifier or MemberExpression, but contains ${node.type}`,
       node.loc,
     );
@@ -574,15 +760,12 @@ export function collectAndMarkUnused(
   tracker.replace(reachableObjects, reachableValues);
 }
 
-function UnsupportedSyntaxError(
-  nodeInfo: string,
-  loc: SourceLocation | null | undefined,
-): Error {
-  const line = loc?.start.line ?? "unknown";
-  const column = loc?.start.column ?? "unknown";
-  return new Error(
-    `Unsupported syntax: ${nodeInfo} at line ${line}, column ${column}`,
-  );
+export class UnsupportedSyntaxError extends Error {
+  constructor(nodeInfo: string, loc: SourceLocation | null | undefined) {
+    const line = loc?.start.line ?? "unknown";
+    const column = loc?.start.column ?? "unknown";
+    super(`Unsupported syntax: ${nodeInfo} at line ${line}, column ${column}`);
+  }
 }
 
 async function importModuleFromJsSrc(
