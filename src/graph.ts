@@ -90,7 +90,7 @@ export function buildMermaid(
     }
   };
 
-  for (const thread of ["main", "worker"] as const) {
+  for (const thread of ["worker", "main"] as const) {
     const env = result[thread].env;
     const prefix = thread === "main" ? "vm" : "vw";
     Object.keys(env).forEach((name, i) => {
@@ -119,7 +119,7 @@ export function buildMermaid(
     [...objectLines]
       .filter(([obj]) => pred(reachedBy.get(obj) ?? new Set()))
       .map(([, line]) => line);
-  for (const thread of ["main", "worker"] as const) {
+  for (const thread of ["worker", "main"] as const) {
     lines.push(`subgraph T_${thread}["${threadLabels[thread]}"]`);
     const inner = [
       ...varLines[thread],
@@ -136,6 +136,9 @@ export function buildMermaid(
     "classDef invalid fill:#ffe3e3,stroke:#e03131,color:#c92a2a",
     "classDef empty fill:none,stroke:none",
     "classDef detached fill:#f1f3f5,stroke:#adb5bd,color:#868e96,stroke-dasharray:4 2",
+    // Fixed per thread so that the colors don't depend on the subgraph order
+    "style T_main fill:#fdf4ff,stroke:#e879f9",
+    "style T_worker fill:#f0fdfa,stroke:#2dd4bf",
   );
   for (const [obj, threads] of reachedBy) {
     if (invalidObjects.has(obj)) {
@@ -146,7 +149,7 @@ export function buildMermaid(
       lines.push(`class ${objectId(obj)} shared`);
     }
   }
-  for (const thread of ["main", "worker"] as const) {
+  for (const thread of ["worker", "main"] as const) {
     if (!lines.includes(`E_${thread}[" "]`)) continue;
     lines.push(`class E_${thread} empty`);
   }
