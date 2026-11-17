@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sharing Simulator (embedded)</title>
+    <style>
+      :root {
+        font:
+          13px system-ui,
+          sans-serif;
+      }
+      body {
+        margin: 0;
+        height: 100vh;
+        display: grid;
+        grid-template-columns: 2fr 1fr;
+      }
+      #graph,
+      #errors {
+        overflow: auto;
+        padding: 8px;
+        box-sizing: border-box;
+      }
+      #errors {
+        border-left: 1px solid #8884;
+      }
+      #graph svg {
+        max-width: 100%;
+        height: auto;
+      }
+      h2 {
+        font-size: 12px;
+        margin: 0 0 4px;
+        opacity: 0.6;
+        text-transform: uppercase;
+      }
+      ul {
+        margin: 0 0 12px;
+        padding-left: 16px;
+      }
+      li {
+        margin-bottom: 4px;
+        white-space: pre-wrap;
+      }
+      .err {
+        color: #e03131;
+      }
+      .note {
+        opacity: 0.6;
+      }
+      @media (max-width: 600px) {
+        body {
+          grid-template-columns: 1fr;
+          height: auto;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="graph"></div>
+    <div id="errors"></div>
+    <script type="module" src="./src/embedded.ts"></script>
+  </body>
+</html>

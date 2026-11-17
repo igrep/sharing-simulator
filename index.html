@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sharing Simulator</title>
+    <style>
+      :root {
+        font:
+          13px system-ui,
+          sans-serif;
+      }
+      body {
+        margin: 0;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
+      form {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 4px;
+        padding: 4px;
+      }
+      select {
+        grid-column: 1 / -1;
+        font: inherit;
+      }
+      label {
+        display: flex;
+        flex-direction: column;
+        font-size: 11px;
+        opacity: 0.8;
+      }
+      textarea {
+        height: 10em;
+        font:
+          13px ui-monospace,
+          monospace;
+        resize: vertical;
+      }
+      iframe {
+        flex: 1;
+        border: 0;
+        border-top: 1px solid #8884;
+        min-height: 300px;
+      }
+      @media (max-width: 600px) {
+        form {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <script type="module" src="./src/index.ts"></script>
+  </body>
+</html>
