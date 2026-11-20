@@ -224,11 +224,14 @@ async function run(): Promise<void> {
   const invalid = findInvalidReferences(result);
   invalidRefs.val = invalid;
   const source = buildMermaid(result, invalid);
+  // Printed with the real console (not the Console tab) so that the diagram
+  // can be copied and tweaked elsewhere.
+  console.log(source);
   try {
     const { svg } = await mermaid.render(`graph${count}`, source);
     if (isCurrent()) graphPane.innerHTML = svg;
   } catch (error) {
-    console.error(source);
+    console.error(error);
     if (isCurrent()) {
       graphPane.replaceChildren(p({ class: "err" }, formatError(error)));
     }
