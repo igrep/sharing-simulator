@@ -51,3 +51,20 @@ export function parseParams(search: string): Params {
 export function toSearch(params: Params): string {
   return `?${new URLSearchParams({ ...params })}`;
 }
+
+export const tabNames = ["graph", "errors", "console"] as const;
+
+export type TabName = (typeof tabNames)[number];
+
+/**
+ * The `tab` query parameter of embedded.html: the tab shown on load. Not
+ * included in `Params` because index.html doesn't set it.
+ */
+export function parseTab(search: string): TabName | null {
+  const tab = new URLSearchParams(search).get("tab");
+  return tabNames.find((t) => t === tab) ?? null;
+}
+
+export function defaultTabFor(mode: ModeName): TabName {
+  return mode === "real" ? "console" : "graph";
+}

@@ -9,25 +9,92 @@
         font:
           13px system-ui,
           sans-serif;
+        --accent: #1c7ed6;
+        --error: #e03131;
+        --line: #8884;
       }
       body {
         margin: 0;
         height: 100vh;
-        display: grid;
-        grid-template-columns: 2fr 1fr;
+        display: flex;
+        flex-direction: column;
       }
-      #graph,
-      #errors {
+      [role="tablist"] {
+        display: flex;
+        gap: 2px;
+        padding: 0 8px;
+        border-bottom: 1px solid var(--line);
+        flex: none;
+      }
+      [role="tab"] {
+        font: inherit;
+        background: none;
+        border: 0;
+        border-bottom: 2px solid transparent;
+        margin-bottom: -1px;
+        padding: 6px 12px;
+        cursor: pointer;
+        color: inherit;
+        opacity: 0.7;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      [role="tab"]:hover {
+        opacity: 1;
+      }
+      [role="tab"][aria-selected="true"] {
+        opacity: 1;
+        border-bottom-color: var(--accent);
+        font-weight: 600;
+      }
+      [role="tab"].has-errors {
+        color: var(--error);
+        opacity: 1;
+      }
+      [role="tab"].has-errors[aria-selected="true"] {
+        border-bottom-color: var(--error);
+      }
+      .badge {
+        font-size: 11px;
+        font-weight: 600;
+        line-height: 1;
+        min-width: 1.4em;
+        padding: 2px 5px;
+        border-radius: 999px;
+        background: #8883;
+        box-sizing: border-box;
+        text-align: center;
+      }
+      .has-errors .badge {
+        background: var(--error);
+        color: #fff;
+      }
+      [role="tabpanel"] {
+        flex: 1;
+        min-height: 0;
         overflow: auto;
         padding: 8px;
         box-sizing: border-box;
       }
-      #errors {
-        border-left: 1px solid #8884;
-      }
       #graph svg {
         max-width: 100%;
         height: auto;
+      }
+      #console:not([hidden]) {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+        padding: 0;
+        overflow: hidden;
+      }
+      #console section {
+        overflow: auto;
+        padding: 8px;
+        min-width: 0;
+      }
+      #console section + section {
+        border-left: 1px solid var(--line);
       }
       h2 {
         font-size: 12px;
@@ -43,23 +110,46 @@
         margin-bottom: 4px;
         white-space: pre-wrap;
       }
+      ol.logs {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        font:
+          12px ui-monospace,
+          monospace;
+      }
+      ol.logs li {
+        margin: 0;
+        padding: 2px 0;
+        border-bottom: 1px solid #8882;
+        overflow-wrap: anywhere;
+      }
       .err {
-        color: #e03131;
+        color: var(--error);
       }
       .note {
         opacity: 0.6;
       }
       @media (max-width: 600px) {
-        body {
+        #console:not([hidden]) {
           grid-template-columns: 1fr;
-          height: auto;
+          overflow: auto;
+        }
+        #console section + section {
+          border-left: 0;
+          border-top: 1px solid var(--line);
         }
       }
     </style>
   </head>
   <body>
-    <div id="graph"></div>
-    <div id="errors"></div>
+    <div id="tabs" role="tablist" aria-label="Result"></div>
+    <div id="graph" role="tabpanel" aria-labelledby="tab-graph"></div>
+    <div id="errors" role="tabpanel" aria-labelledby="tab-errors" hidden></div>
+    <div id="console" role="tabpanel" aria-labelledby="tab-console" hidden>
+      <section><h2>Main thread</h2></section>
+      <section><h2>Worker thread</h2></section>
+    </div>
     <script type="module" src="./src/embedded.ts"></script>
   </body>
 </html>

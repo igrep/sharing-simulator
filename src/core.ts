@@ -16,6 +16,7 @@ import {
   type ArrowFunctionExpression,
 } from "acorn";
 import { generate } from "astring";
+import { formatLogArgs } from "./format.js";
 
 export type Environment = Record<string, any>;
 
@@ -31,6 +32,7 @@ export interface SimulatedWorker {
 
 const envArgName = "$ENV" as const;
 const trackerArgName = "$TRACKER" as const;
+const consoleArgName = "$CONSOLE" as const;
 export const threadIds: Record<ThreadName, symbol> = {
   main: Symbol("main"),
   worker: Symbol("worker"),
@@ -50,6 +52,17 @@ export interface ThreadError {
   error: unknown;
 }
 
+export interface ThreadLog {
+  thread: ThreadName;
+  /** The arguments of `console.log`, formatted when it was called */
+  text: string;
+}
+
+export interface Reporters {
+  reportError: (error: ThreadError) => void;
+  reportLog: (log: ThreadLog) => void;
+}
+
 export interface ThreadState {
   env: Environment;
   tracker: Tracker;
@@ -65,21 +78,24 @@ export interface SimulationResult {
 
 export interface RealResult {
   kind: "real";
-  worker: Worker;
+  /** Stop the worker and its `console.log` forwarding */
+  terminate: () => void;
 }
 
 /**
- * Evaluate the given code. Errors (including the ones raised asynchronously by
- * a real worker) are reported through `reportError`.
+ * Evaluate the given code. Errors and `console.log` outputs (including the
+ * ones produced asynchronously by a real worker) are reported through
+ * `reporters`.
  */
 export function evaluate(
   mainCode: string,
   workerCode: string,
   mode: EvaluationMode,
-  reportError: (error: ThreadError) => void,
+  reporters: Reporters,
 ): SimulationResult | RealResult {
+  const { reportError } = reporters;
   if (mode === EvaluationMode.RUN_REAL_WORKER) {
-    return runRealWorker(mainCode, workerCode, reportError);
+    return runRealWorker(mainCode, workerCode, reporters);
   }
 
   const worker: ThreadState = {
@@ -100,8 +116,8 @@ export function evaluate(
     enumerable: false, // Not shown in the graph
   });
 
-  runSimulatedThread("worker", workerCode, worker, reportError);
-  runSimulatedThread("main", mainCode, main, reportError);
+  runSimulatedThread("worker", workerCode, worker, reporters);
+  runSimulatedThread("main", mainCode, main, reporters);
 
   collectAndMarkUnused(main.env, main.tracker);
   collectAndMarkUnused(worker.env, worker.tracker);
@@ -112,15 +128,33 @@ function runSimulatedThread(
   thread: ThreadName,
   code: string,
   state: ThreadState,
-  reportError: (error: ThreadError) => void,
+  { reportError, reportLog }: Reporters,
 ): void {
   try {
     const src = transformWithDebug(thread, code);
-    const fn = new Function(envArgName, trackerArgName, `"use strict";${src}`);
-    fn(createEnvProxy(state.env), state.tracker);
+    const fn = new Function(
+      envArgName,
+      trackerArgName,
+      consoleArgName,
+      `"use strict";${src}`,
+    );
+    fn(
+      createEnvProxy(state.env),
+      state.tracker,
+      createConsole(thread, reportLog),
+    );
   } catch (error) {
     reportError({ thread, error });
   }
+}
+
+function createConsole(
+  thread: ThreadName,
+  reportLog: (log: ThreadLog) => void,
+): { log: (...args: unknown[]) => void } {
+  return {
+    log: (...args) => reportLog({ thread, text: formatLogArgs(args) }),
+  };
 }
 
 /** Make reading an undefined variable a ReferenceError, like real JS. */
@@ -135,16 +169,48 @@ function createEnvProxy(env: Environment): Environment {
   });
 }
 
+/**
+ * Prepended to the real worker code to forward `console.log` to the main
+ * thread through a dedicated `MessagePort`, which is the first message the
+ * worker receives. Kept in a single line not to shift the line numbers in
+ * error messages.
+ */
+const realWorkerPrelude = `(() => {
+  const clone = (a) => { try { return structuredClone(a); } catch { try { return String(a); } catch { return Object.prototype.toString.call(a); } } };
+  let port = null;
+  const queue = [];
+  self.console = { log: (...args) => { const cloned = args.map(clone); if (port) port.postMessage(cloned); else queue.push(cloned); } };
+  self.addEventListener("message", function receivePort(e) {
+    e.stopImmediatePropagation();
+    self.removeEventListener("message", receivePort);
+    port = e.ports[0];
+    for (const args of queue.splice(0)) port.postMessage(args);
+  });
+})();`.replace(/\n\s*/g, " ");
+
 function runRealWorker(
   mainCode: string,
   workerCode: string,
-  reportError: (error: ThreadError) => void,
+  { reportError, reportLog }: Reporters,
 ): RealResult {
+  try {
+    checkConsoleUsage(workerCode);
+  } catch (error) {
+    reportError({ thread: "worker", error });
+    workerCode = "";
+  }
   const url = URL.createObjectURL(
-    new Blob([workerCode], { type: "application/javascript" }),
+    new Blob([realWorkerPrelude, workerCode], {
+      type: "application/javascript",
+    }),
   );
   const worker = new Worker(url);
   URL.revokeObjectURL(url);
+  const channel = new MessageChannel();
+  channel.port1.onmessage = (event: MessageEvent<unknown[]>) => {
+    reportLog({ thread: "worker", text: formatLogArgs(event.data) });
+  };
+  worker.postMessage(null, [channel.port2]);
   worker.addEventListener("error", (event) => {
     event.preventDefault();
     reportError({
@@ -159,11 +225,76 @@ function runRealWorker(
     });
   });
   try {
-    new Function("worker", `"use strict";${mainCode}`)(worker);
+    checkConsoleUsage(mainCode);
+    new Function("worker", "console", `"use strict";${mainCode}`)(
+      worker,
+      createConsole("main", reportLog),
+    );
   } catch (error) {
     reportError({ thread: "main", error });
   }
-  return { kind: "real", worker };
+  return {
+    kind: "real",
+    terminate: () => {
+      worker.terminate();
+      channel.port1.close();
+    },
+  };
+}
+
+/**
+ * The real worker code isn't transformed, so check statically that only
+ * `console.log` is used. Unparsable code is left to the JS engine to report.
+ */
+function checkConsoleUsage(code: string): void {
+  let program: Program;
+  try {
+    program = parse(code, { ecmaVersion: "latest", locations: true });
+  } catch {
+    return;
+  }
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      node.forEach(walk);
+      return;
+    }
+    if (!isTrackable(node) || !("type" in node)) return;
+    const n = node as Node;
+    if (n.type === "MemberExpression") {
+      const { object, property, computed } = n as unknown as {
+        object: Node;
+        property: Node;
+        computed: boolean;
+      };
+      if (
+        object.type === "Identifier" &&
+        (object as unknown as { name: string }).name === "console"
+      ) {
+        assertConsoleLog(property, computed, n.loc);
+      }
+    }
+    for (const [key, value] of Object.entries(node)) {
+      if (key !== "loc") walk(value);
+    }
+  };
+  walk(program);
+}
+
+function assertConsoleLog(
+  property: Node,
+  computed: boolean,
+  loc: SourceLocation | null | undefined,
+): void {
+  const name =
+    !computed && property.type === "Identifier"
+      ? (property as unknown as { name: string }).name
+      : null;
+  if (name !== "log") {
+    throw new UnsupportedSyntaxError(
+      `console.${name ?? "[...]"} (only console.log is supported)`,
+      loc,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -419,12 +550,13 @@ function describeType(value: unknown): string {
 // - Statements: variable declarations and expression statements.
 // - Expressions: literals, variable references, member access, array and
 //   object literals, assignments (`=` only), unary/binary/logical operators,
-//   `new ArrayBuffer(...)`, `worker.postMessage(...)`, `console.*(...)`, and
+//   `new ArrayBuffer(...)`, `worker.postMessage(...)`, `console.log(...)`, and
 //   a function assigned to `onmessage`.
 // Every top-level variable `x` is turned into `$ENV.x`, and every assigned
-// value is wrapped with `$TRACKER.track(...)`.
+// value is wrapped with `$TRACKER.track(...)`, and `console.log(...)` is turned
+// into `$CONSOLE.log(...)`.
 
-const globalNames = new Set(["undefined", "ArrayBuffer", "console"]);
+const globalNames = new Set(["undefined", "ArrayBuffer"]);
 
 interface Scope {
   thread: ThreadName;
@@ -531,6 +663,12 @@ function transformExpression(expression: Expression, scope: Scope): Expression {
         globalNames.has(expression.name)
       ) {
         return expression;
+      }
+      if (expression.name === "console") {
+        throw new UnsupportedSyntaxError(
+          "Referring to `console` other than calling `console.log(...)`",
+          expression.loc,
+        );
       }
       return envMember(expression.name, expression);
     case "MemberExpression":
@@ -651,18 +789,33 @@ function transformExpression(expression: Expression, scope: Scope): Expression {
       };
     case "CallExpression": {
       const { callee } = expression;
+      if (
+        callee.type === "MemberExpression" &&
+        callee.object.type === "Identifier" &&
+        callee.object.name === "console" &&
+        !scope.locals?.has("console")
+      ) {
+        assertConsoleLog(callee.property, callee.computed, callee.loc);
+        return {
+          ...expression,
+          callee: {
+            ...callee,
+            object: identifier(consoleArgName, callee.object),
+          },
+          arguments: expression.arguments.map((arg) => recur(notSpread(arg))),
+        };
+      }
       const isAllowed =
         callee.type === "MemberExpression" &&
         !callee.computed &&
         callee.object.type === "Identifier" &&
         callee.property.type === "Identifier" &&
-        ((scope.thread === "main" &&
-          callee.object.name === "worker" &&
-          callee.property.name === "postMessage") ||
-          callee.object.name === "console");
+        scope.thread === "main" &&
+        callee.object.name === "worker" &&
+        callee.property.name === "postMessage";
       if (!isAllowed) {
         throw new UnsupportedSyntaxError(
-          "Function call other than `worker.postMessage(...)` (main thread only) or `console.*(...)`",
+          "Function call other than `worker.postMessage(...)` (main thread only) or `console.log(...)`",
           expression.loc,
         );
       }
